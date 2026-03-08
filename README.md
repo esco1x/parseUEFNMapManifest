@@ -101,6 +101,9 @@ Most (if not all) published UEFN maps are encrypted. The script fetches the decr
 
 ---
 
+## Note
+P.S. Yes this is vibecoded so there could be issues, i wanted to see how much AI can do and if it could figure out how to parse fortnite files. I've seen a lot of parsers but almost none of them are written in JS so i wanted to see if it was possible. (pls don't hate me, this is still cool and it does work at the time of writing this)
+
 ## License
 
 Use and modify as you like.
