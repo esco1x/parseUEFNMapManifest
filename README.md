@@ -18,7 +18,7 @@
 
 ```bash
 git clone https://github.com/esco1x/parseUEFNMapManifest.git
-cd parseUEFNManifest
+cd parseUEFNMapManifest
 npm install
 node parseUEFNManifest.js
 ```
