@@ -6,6 +6,7 @@ const crypto = require('crypto');
 const readline = require('readline');
 const pako = require('pako');
 const axios = require('axios');
+const os = require('os');
 
 const HEADER_MAGIC = 0x44bec00c;
 const CONCURRENCY = 5;
@@ -71,11 +72,49 @@ const EPIC_UEFN_CLIENT_SECRET = '530e316c337e409893c55ec44f22cd62';
 const CONTENT_API = 'https://content-service.bfda.live.use1a.on.epicgames.com';
 const OAUTH_URL = 'https://account-public-service-prod.ol.epicgames.com/account/api/oauth/token';
 const AUTH_REDIRECT = 'https://www.epicgames.com/id/api/redirect';
+const OAUTH_EXCHANGE_URL = 'https://account-public-service-prod.ol.epicgames.com/account/api/oauth/exchange';
+const OAUTH_VERIFY_URL = 'https://account-public-service-prod.ol.epicgames.com/account/api/oauth/verify';
+
+const LAUNCHER_CLIENT_ID = '34a02cf8f4414e29b15921876da36f9a';
+const LAUNCHER_CLIENT_SECRET = 'daafbccc737745039dffe53d94fc76cf';
+
+const FORTNITE_STUDIO_ASSETS_URL =
+  'https://launcher-public-service-prod06.ol.epicgames.com/launcher/api/public/assets/v2/platform/Windows/namespace/fn/catalogItem/1e8bda5cfbb641b9a9aea8bd62285f73/app/Fortnite_Studio/label/Live';
 
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 const ask = (q) => new Promise((r) => rl.question(q, r));
 
 const CONFIG_PATH = path.join(__dirname, 'parseUEFNManifest.config.json');
+const TOKENS_PATH = path.join(__dirname, 'parseUEFNTokens.json');
+
+let fortniteUaBuildSegment = process.env.UEFN_UA_BUILD || '++Fortnite+Release-40.00-CL-51995682';
+
+function setFortniteUaBuildFromResolvedVersion(ver) {
+  if (!ver) return;
+  if (ver.rawBuildVersion != null && ver.rawBuildVersion !== '') {
+    fortniteUaBuildSegment = String(ver.rawBuildVersion).replace(/-Windows$/i, '').trim();
+    return;
+  }
+  if (ver.major != null && ver.minor != null && ver.cl != null) {
+    const minPad = String(Number(ver.minor)).padStart(2, '0');
+    fortniteUaBuildSegment = `++Fortnite+Release-${ver.major}.${minPad}-CL-${ver.cl}`;
+  }
+}
+
+function getFortniteGameUserAgent() {
+  const core = String(fortniteUaBuildSegment).replace(/-Windows$/i, '').trim();
+  const winBuild = process.platform === 'win32' ? `${os.release()}.1.768.64bit` : '10.0.26200.1.768.64bit';
+  return `FortniteGame/${core} (http-eventloop) Windows/${winBuild}`;
+}
+
+axios.interceptors.request.use((config) => {
+  config.headers = config.headers || {};
+  const h = config.headers;
+  if (h['User-Agent'] == null && h['user-agent'] == null) {
+    h['User-Agent'] = getFortniteGameUserAgent();
+  }
+  return config;
+});
 
 function loadConfig() {
   try {
@@ -193,54 +232,315 @@ function getAuthUrl(clientId) {
 async function exchangeAuthCode(clientId, clientSecret, code) {
   const basicAuth = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
   const body = new URLSearchParams({ grant_type: 'authorization_code', code }).toString();
-  const { data } = await axios.post(OAUTH_URL, body, {
-    headers: {
-      'Content-Type': 'application/x-www-form-urlencoded',
-      Authorization: `Basic ${basicAuth}`,
-    },
-  });
-  return data;
+  try {
+    const { data } = await axios.post(OAUTH_URL, body, {
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        Authorization: `Basic ${basicAuth}`,
+      },
+    });
+    return data;
+  } catch (e) {
+    logAxiosError(`OAuth token exchange (POST ${OAUTH_URL})`, e);
+    throw e;
+  }
 }
 
-async function getLatestVersion() {
-  const { data } = await axios.get('https://api.fortniteapi.com/v1/versions');
+function tokenExpiryToMs(tokenResponse) {
+  if (!tokenResponse || typeof tokenResponse !== 'object') return Date.now() + 8 * 3600 * 1000;
+  if (tokenResponse.expires_at) {
+    const t = new Date(tokenResponse.expires_at).getTime();
+    if (!Number.isNaN(t)) return t;
+  }
+  if (typeof tokenResponse.expires_in === 'number' && tokenResponse.expires_in > 0) {
+    return Date.now() + tokenResponse.expires_in * 1000;
+  }
+  return Date.now() + 8 * 3600 * 1000;
+}
+
+function loadEpicTokens() {
+  try {
+    const raw = fs.readFileSync(TOKENS_PATH, 'utf8');
+    const o = JSON.parse(raw);
+    return o && typeof o === 'object' ? o : {};
+  } catch (_) {
+    return {};
+  }
+}
+
+function saveEpicTokensMerge(patch, noSave) {
+  if (noSave || process.env.UEFN_NO_SAVE_TOKENS === '1') return;
+  const cur = loadEpicTokens();
+  const next = { ...cur, ...patch };
+  fs.writeFileSync(TOKENS_PATH, JSON.stringify(next, null, 2), 'utf8');
+}
+
+function normalizeEngineVersion(major, minor, cl) {
+  const mj = String(Number(String(major).trim()));
+  const mn = String(Number(String(minor).trim()));
+  const patch = String(String(cl).trim());
+  return { major: mj, minor: mn, cl: patch, cdnPathSegment: `${mj}.${mn}.${patch}` };
+}
+
+function parseEngineVersionString(s) {
+  const t = String(s).trim();
+  const parts = t.split('.');
+  if (parts.length < 3) throw new Error(`Invalid --engine-version "${t}" (need major.minor.changelist, e.g. 40.0.51995682)`);
+  const major = parts[0];
+  const minor = parts[1];
+  const cl = parts.slice(2).join('.');
+  return normalizeEngineVersion(major, minor, cl);
+}
+
+function tryReadEngineVersionFromPaksDir(paksDir) {
+  if (!paksDir || !fs.existsSync(paksDir)) return null;
+  const re = /\+\+Fortnite\+Release-(\d+)\.(\d+)-CL-(\d+)/i;
+  let bestCl = -1;
+  let best = null;
+  try {
+    for (const n of fs.readdirSync(paksDir)) {
+      const m = n.match(re);
+      if (!m) continue;
+      const clNum = parseInt(m[3], 10);
+      if (clNum > bestCl) {
+        bestCl = clNum;
+        best = normalizeEngineVersion(m[1], m[2], m[3]);
+      }
+    }
+  } catch (_) {}
+  return best;
+}
+
+async function getLatestVersionFromFortniteApi() {
+  const versionsUrl = 'https://api.fortniteapi.com/v1/versions';
+  const { data } = await axios.get(versionsUrl);
   const latest = data.find(
     (v) => v.meta?.tag === 'latest' && v.meta?.state === 'READY' && v.version?.platform === 'Windows'
   );
   if (!latest) throw new Error('Unable to find latest Fortnite version.');
-  const [major, minor] = latest.version.id.split('.');
+  const idParts = String(latest.version.id || '').split('.');
+  const major = idParts[0] || '0';
+  const minor = idParts[1] != null ? idParts[1] : '0';
   const cl = latest.version.build;
-  return { major, minor, cl };
+  return normalizeEngineVersion(major, minor, cl);
+}
+
+function parseBuildVersionFromLauncherString(buildVersion) {
+  const re = /\+\+Fortnite\+Release-(\d+)\.(\d+)-CL-(\d+)/i;
+  const m = String(buildVersion || '').match(re);
+  if (!m) return null;
+  return normalizeEngineVersion(m[1], m[2], m[3]);
+}
+
+async function verifyAccessToken(accessToken) {
+  if (!accessToken || typeof accessToken !== 'string') return false;
+  try {
+    const { status } = await axios.get(OAUTH_VERIFY_URL, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+      validateStatus: (s) => s < 500,
+    });
+    return status === 200;
+  } catch (_) {
+    return false;
+  }
+}
+
+async function refreshUeFnToken(refreshToken) {
+  const basicAuth = Buffer.from(`${EPIC_UEFN_CLIENT_ID}:${EPIC_UEFN_CLIENT_SECRET}`).toString('base64');
+  const body = new URLSearchParams({ grant_type: 'refresh_token', refresh_token: refreshToken }).toString();
+  try {
+    const { data } = await axios.post(OAUTH_URL, body, {
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        Authorization: `Basic ${basicAuth}`,
+      },
+    });
+    return data;
+  } catch (e) {
+    logAxiosError('refreshUeFnToken', e);
+    throw e;
+  }
+}
+
+async function exchangeUeFnTokenForLauncherToken(uefnAccessToken) {
+  try {
+    const ex = await axios.get(OAUTH_EXCHANGE_URL, {
+      headers: { Authorization: `Bearer ${uefnAccessToken}` },
+    });
+    const exchangeCode = ex.data?.code;
+    if (!exchangeCode) throw new Error('OAuth exchange returned no code (UEFN token may not allow exchange)');
+
+    const launcherBasic = Buffer.from(`${LAUNCHER_CLIENT_ID}:${LAUNCHER_CLIENT_SECRET}`).toString('base64');
+    const body = new URLSearchParams({
+      grant_type: 'exchange_code',
+      exchange_code: exchangeCode,
+    }).toString();
+    const { data } = await axios.post(OAUTH_URL, body, {
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        Authorization: `Basic ${launcherBasic}`,
+      },
+    });
+    return data;
+  } catch (e) {
+    logAxiosError('exchangeUeFnTokenForLauncherToken', e);
+    throw e;
+  }
+}
+
+async function getOrRefreshLauncherAccessToken(uefnAccessToken, opts = {}) {
+  const saved = loadEpicTokens();
+  const skewMs = 120000;
+  if (saved.launcherAccessToken) {
+    const freshEnough = !saved.launcherExpiresAt || saved.launcherExpiresAt > Date.now() + skewMs;
+    if (freshEnough || !saved.launcherExpiresAt) {
+      if (await verifyAccessToken(saved.launcherAccessToken)) {
+        if (isHttpDebug(opts)) console.error('[tokens] Using saved launcher token');
+        return saved.launcherAccessToken;
+      }
+    } else if (await verifyAccessToken(saved.launcherAccessToken)) {
+      if (isHttpDebug(opts)) console.error('[tokens] Using saved launcher token (past soft expiry, verify OK)');
+      return saved.launcherAccessToken;
+    }
+  }
+
+  const launcherData = await exchangeUeFnTokenForLauncherToken(uefnAccessToken);
+  const launcherToken = launcherData.access_token;
+  if (!launcherToken) throw new Error('Launcher token response missing access_token');
+  const launcherExpiresAt = tokenExpiryToMs(launcherData);
+  if (!opts.noSaveTokens) {
+    saveEpicTokensMerge({ launcherAccessToken: launcherToken, launcherExpiresAt }, opts.noSaveTokens);
+  }
+  return launcherToken;
+}
+
+async function fetchFortniteStudioBuildVersion(launcherAccessToken, opts = {}) {
+  try {
+    if (isHttpDebug(opts)) console.error('[launcher] GET', FORTNITE_STUDIO_ASSETS_URL);
+    const { data } = await axios.get(FORTNITE_STUDIO_ASSETS_URL, {
+      headers: { Authorization: `Bearer ${launcherAccessToken}` },
+    });
+    const el = data?.elements?.[0];
+    const bv = el?.buildVersion;
+    if (!bv) throw new Error('Launcher assets: elements[0].buildVersion missing');
+    const parsed = parseBuildVersionFromLauncherString(bv);
+    if (!parsed) throw new Error(`Launcher assets: could not parse buildVersion "${bv}"`);
+    return { ...parsed, rawBuildVersion: bv };
+  } catch (e) {
+    logAxiosError('fetchFortniteStudioBuildVersion', e);
+    throw e;
+  }
+}
+
+async function tryLoadValidUeFnToken(opts = {}) {
+  if (opts.freshLogin) return null;
+  const saved = loadEpicTokens();
+  if (!saved.uefnAccessToken) return null;
+
+  const tryRefresh = async () => {
+    if (!saved.uefnRefreshToken) return null;
+    try {
+      const td = await refreshUeFnToken(saved.uefnRefreshToken);
+      const at = td.access_token;
+      if (!at) return null;
+      saveEpicTokensMerge(
+        {
+          uefnAccessToken: at,
+          uefnExpiresAt: tokenExpiryToMs(td),
+          uefnRefreshToken: td.refresh_token || saved.uefnRefreshToken,
+        },
+        opts.noSaveTokens
+      );
+      return (await verifyAccessToken(at)) ? at : null;
+    } catch (_) {
+      return null;
+    }
+  };
+
+  if (saved.uefnExpiresAt && saved.uefnExpiresAt < Date.now() + 30000) {
+    return tryRefresh();
+  }
+  if (await verifyAccessToken(saved.uefnAccessToken)) return saved.uefnAccessToken;
+  return tryRefresh();
+}
+
+async function resolveFortniteEngineVersion(config, opts = {}) {
+  const envVer = process.env.UEFN_ENGINE_VERSION;
+  if (opts.engineVersionOverride) {
+    const v = parseEngineVersionString(opts.engineVersionOverride);
+    return { ...v, source: '--engine-version' };
+  }
+  if (envVer && String(envVer).trim()) {
+    const v = parseEngineVersionString(envVer);
+    return { ...v, source: 'UEFN_ENGINE_VERSION' };
+  }
+  if (opts.uefnAccessToken) {
+    try {
+      const launcherTok = await getOrRefreshLauncherAccessToken(opts.uefnAccessToken, opts);
+      if (launcherTok) {
+        const fromLauncher = await fetchFortniteStudioBuildVersion(launcherTok, opts);
+        return {
+          ...fromLauncher,
+          source: `Epic launcher Fortnite_Studio Live (${fromLauncher.rawBuildVersion})`,
+        };
+      }
+    } catch (e) {
+      if (isHttpDebug(opts)) console.error('[engine] Launcher API buildVersion failed:', e.message || e);
+    }
+  }
+  const paksDir = config?.fortniteGamePath ? path.join(config.fortniteGamePath, 'Content', 'Paks') : null;
+  const fromPaks = tryReadEngineVersionFromPaksDir(paksDir);
+  if (fromPaks) {
+    return { ...fromPaks, source: 'local Paks (Release-*-CL-* filename)' };
+  }
+  const versionsUrl = 'https://api.fortniteapi.com/v1/versions';
+  try {
+    const v = await getLatestVersionFromFortniteApi();
+    return { ...v, source: `FortniteAPI ${versionsUrl} (may lag behind live client)` };
+  } catch (e) {
+    if (e.message !== 'Unable to find latest Fortnite version.') logAxiosError(`getLatestVersion (GET ${versionsUrl})`, e);
+    throw e;
+  }
 }
 
 async function getCookedContentPackage(token, mapCode, major, minor, cl) {
   const mapCodeNorm = mapCode.replace(/\s/g, '').trim();
   const url = `${CONTENT_API}/api/content/v2/link/${mapCodeNorm}/cooked-content-package`;
-  const { data } = await axios.get(url, {
-    params: { role: 'client', platform: 'windows', major, minor, patch: cl },
-    headers: { Authorization: `Bearer ${token}` },
-  });
-  return data;
+  try {
+    const { data } = await axios.get(url, {
+      params: { role: 'client', platform: 'windows', major, minor, patch: cl },
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    return data;
+  } catch (e) {
+    logAxiosError('getCookedContentPackage', e);
+    throw e;
+  }
 }
 
 async function getModuleKey(token, moduleId, version) {
   const url = `${CONTENT_API}/api/content/v4/module/${moduleId}/version/${version}/key`;
-  const { data } = await axios.get(url, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
-  const aesKey = '0x' + Buffer.from(data.key.Key, 'base64').toString('hex').toUpperCase();
-  const guid = data.key.Guid;
-  if (process.env.UEFN_DEBUG_KEY === '1' && data.key) {
-    try {
-      const k = data.key;
-      console.error('[key response] Guid:', typeof k.Guid === 'string' ? k.Guid : JSON.stringify(k.Guid));
-      console.error('[key response] Key: ' + (k.Key ? `${String(k.Key).length} chars (base64)` : 'missing'));
-      if (k.ChunkKeys && Array.isArray(k.ChunkKeys)) {
-        console.error('[key response] ChunkKeys length:', k.ChunkKeys.length);
-      }
-    } catch (_) {}
+  try {
+    const { data } = await axios.get(url, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    const aesKey = '0x' + Buffer.from(data.key.Key, 'base64').toString('hex').toUpperCase();
+    const guid = data.key.Guid;
+    if (process.env.UEFN_DEBUG_KEY === '1' && data.key) {
+      try {
+        const k = data.key;
+        console.error('[key response] Guid:', typeof k.Guid === 'string' ? k.Guid : JSON.stringify(k.Guid));
+        console.error('[key response] Key: ' + (k.Key ? `${String(k.Key).length} chars (base64)` : 'missing'));
+        if (k.ChunkKeys && Array.isArray(k.ChunkKeys)) {
+          console.error('[key response] ChunkKeys length:', k.ChunkKeys.length);
+        }
+      } catch (_) {}
+    }
+    return { aesKey, guid };
+  } catch (e) {
+    logAxiosError('getModuleKey', e);
+    throw e;
   }
-  return { aesKey, guid };
 }
 
 function readFString(buffer, pos) {
@@ -366,7 +666,6 @@ function parseEpicManifestBody(data) {
     fileSizes.push(Number(data.readBigUInt64LE(pos)));
     pos += 8;
   }
-  const pad2 = (n) => String(n).padStart(2, '0');
   const chunks = [];
   for (let i = 0; i < count; i++) {
     const guidHex = guids[i].map((x) => x.toString(16).toUpperCase().padStart(8, '0')).join('');
@@ -415,21 +714,104 @@ function parseUEFNManifest(filePath) {
   return parseUEFNManifestFromBuffer(fs.readFileSync(filePath));
 }
 
+function isHttpDebug(options = {}) {
+  return options.debug === true || process.argv.includes('--debug');
+}
+
+function logAxiosError(label, err) {
+  if (!isHttpDebug()) return;
+  const cfg = err.config;
+  const res = err.response;
+  console.error(`[HTTP] ${label} — request failed`);
+  if (cfg) {
+    const method = String(cfg.method || 'get').toUpperCase();
+    let fullUrl = cfg.url || '';
+    if (cfg.baseURL && fullUrl && !/^https?:\/\//i.test(fullUrl)) {
+      fullUrl = String(cfg.baseURL).replace(/\/?$/, '/') + String(fullUrl).replace(/^\//, '');
+    }
+    console.error('[HTTP] Method:', method);
+    console.error('[HTTP] URL:', fullUrl || '(unknown)');
+    if (cfg.params && typeof cfg.params === 'object' && Object.keys(cfg.params).length) {
+      console.error('[HTTP] params (may already be in URL):', JSON.stringify(cfg.params));
+    }
+  }
+  if (res) {
+    console.error('[HTTP] Status:', res.status, res.statusText || '');
+    console.error('[HTTP] Response headers:', JSON.stringify(res.headers, null, 2));
+    let preview;
+    const data = res.data;
+    if (Buffer.isBuffer(data)) preview = data.subarray(0, 2048).toString('utf8');
+    else if (typeof data === 'string') preview = data.slice(0, 2048);
+    else try { preview = JSON.stringify(data, null, 2).slice(0, 2048); } catch (_) { preview = String(data).slice(0, 2048); }
+    console.error('[HTTP] Response body length:', typeof data === 'string' || Buffer.isBuffer(data) ? data.length : '(n/a)');
+    console.error('[HTTP] Response body preview:', preview && preview.length >= 2048 ? `${preview}…` : preview);
+  } else if (err.message) {
+    console.error('[HTTP] No response object:', err.message);
+    if (err.code) console.error('[HTTP] err.code:', err.code);
+  }
+}
+
 function get(url, options = {}) {
+  const debug = isHttpDebug(options);
   return new Promise((resolve, reject) => {
-    const headers = { 'User-Agent': 'EpicGames/1.0', ...options.headers };
+    const headers = { 'User-Agent': getFortniteGameUserAgent(), ...options.headers };
     if (options.token) headers['Authorization'] = `Bearer ${options.token}`;
+    if (debug) {
+      console.error('[HTTP] GET', url);
+      const safeHeaders = { ...headers };
+      if (safeHeaders.Authorization) safeHeaders.Authorization = 'Bearer ***';
+      console.error('[HTTP] Request headers:', JSON.stringify(safeHeaders));
+    }
     https.get(url, { headers }, (res) => {
-      if (res.statusCode === 301 || res.statusCode === 302) return get(res.headers.location, options).then(resolve).catch(reject);
-      if (res.statusCode !== 200) {
-        reject(new Error(`HTTP ${res.statusCode}`));
-        return;
+      const code = res.statusCode;
+      if (code === 301 || code === 302 || code === 303 || code === 307 || code === 308) {
+        const loc = res.headers.location;
+        if (!loc) {
+          const err = new Error(`HTTP ${code} redirect without Location`);
+          err.statusCode = code;
+          err.url = url;
+          if (debug) console.error('[HTTP]', code, 'redirect missing Location for', url);
+          res.resume();
+          reject(err);
+          return;
+        }
+        const nextUrl = /^https?:\/\//i.test(loc) ? loc : new URL(loc, url).href;
+        if (debug) console.error('[HTTP]', code, 'redirect ->', nextUrl);
+        res.resume();
+        return get(nextUrl, options).then(resolve).catch(reject);
       }
       const chunks = [];
       res.on('data', (c) => chunks.push(c));
-      res.on('end', () => resolve(Buffer.concat(chunks)));
-      res.on('error', reject);
-    }).on('error', reject);
+      res.on('end', () => {
+        const body = Buffer.concat(chunks);
+        if (code !== 200) {
+          const err = new Error(`HTTP ${code}`);
+          err.statusCode = code;
+          err.statusMessage = res.statusMessage;
+          err.url = url;
+          err.responseHeaders = res.headers;
+          err.responseBodyPreview = body.subarray(0, 4096);
+          if (debug) {
+            console.error('[HTTP]', code, res.statusMessage || '', 'GET', url);
+            console.error('[HTTP] Response headers:', JSON.stringify(res.headers, null, 2));
+            const text = body.subarray(0, 4096).toString('utf8');
+            console.error('[HTTP] Response body length:', body.length);
+            console.error('[HTTP] Response body preview:', text.length >= 4096 ? `${text.slice(0, 4096)}…` : text || '(empty)');
+          }
+          reject(err);
+          return;
+        }
+        if (debug) console.error('[HTTP] 200 OK', url, `(${body.length} bytes)`);
+        resolve(body);
+      });
+      res.on('error', (e) => {
+        if (debug) console.error('[HTTP] response stream error for', url, e.message || e);
+        reject(e);
+      });
+    }).on('error', (e) => {
+      if (debug) console.error('[HTTP] socket/request error GET', url, e.message || e, e.code || '');
+      reject(e);
+    });
   });
 }
 
@@ -638,7 +1020,7 @@ function tryDecryptChunk(data, aesKeyHex, chunkGuidHex, keyGuid, chunkHashHex, c
           try {
             const raw = decryptCbc(ivAt16, payload, true);
             if (hasZlibMagic(raw)) return raw;
-            if (!fallback) fallback = raw; // e.g. Oodle payload (no zlib)
+            if (!fallback) fallback = raw;
           } catch (_) {}
         }
         const fullBlockAligned = Math.floor(data.length / 16) * 16;
@@ -649,7 +1031,7 @@ function tryDecryptChunk(data, aesKeyHex, chunkGuidHex, keyGuid, chunkHashHex, c
           try {
             const rawFull = decryptCbc(ivAt16, fullPayload, true);
             if (hasZlibMagic(rawFull)) return rawFull;
-            if (!fallback) fallback = rawFull; // e.g. Oodle payload (no zlib)
+            if (!fallback) fallback = rawFull;
           } catch (_) {}
         }
       }
@@ -759,7 +1141,7 @@ function tryDecryptChunk(data, aesKeyHex, chunkGuidHex, keyGuid, chunkHashHex, c
 }
 
 async function downloadAll(chunks, baseUrl, outDir, opts = {}) {
-  const { aesKeyHex, guid, keyGuid, chunkPrefix = '' } = opts;
+  const { aesKeyHex, keyGuid, chunkPrefix = '' } = opts;
   const prefix = chunkPrefix.endsWith('/') ? chunkPrefix : chunkPrefix ? chunkPrefix + '/' : '';
   if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
   const queue = [...chunks];
@@ -1030,6 +1412,8 @@ async function runWorker() {
 
 async function reassemble(chunkData, chunksDir, outDir, decryptOpts, opts = {}) {
   const debug = !!opts.debug;
+  const debugDir = debug ? path.join(outDir, 'debug') : null;
+  if (debugDir && !fs.existsSync(debugDir)) fs.mkdirSync(debugDir, { recursive: true });
   const { chunks, fileManifestList } = chunkData;
   const guidToChunk = new Map();
   for (const c of chunks) guidToChunk.set(c.guidHex, c);
@@ -1118,10 +1502,10 @@ async function reassemble(chunkData, chunksDir, outDir, decryptOpts, opts = {}) 
             const required = chunkRequiredSize.get(part.guidHex) || 0;
             if (debug) {
               const line = `${part.guidHex} decLen=${dec ? dec.length : 0} rawLen=${raw.length} required=${required}\n`;
-              fs.appendFileSync(path.join(outDir, 'missing_chunks_debug.txt'), line);
+              fs.appendFileSync(path.join(debugDir, 'missing_chunks_debug.txt'), line);
             }
             if (debug && !dec && raw.length === 1048642) {
-              const hexPath = path.join(outDir, 'failing_chunk_raw_hex.txt');
+              const hexPath = path.join(debugDir, 'failing_chunk_raw_hex.txt');
               if (!fs.existsSync(hexPath)) {
                 const first256 = raw.subarray(0, Math.min(256, raw.length));
                 const last128 = raw.subarray(Math.max(0, raw.length - 128));
@@ -1164,8 +1548,11 @@ async function reassemble(chunkData, chunksDir, outDir, decryptOpts, opts = {}) 
   }
   if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
   if (debug) {
-    const missingChunksDebugPath = path.join(outDir, 'missing_chunks_debug.txt');
+    const missingChunksDebugPath = path.join(debugDir, 'missing_chunks_debug.txt');
     try { fs.unlinkSync(missingChunksDebugPath); } catch (_) {}
+    const decodePath = path.join(debugDir, 'plugin.decode.json');
+    fs.writeFileSync(decodePath, JSON.stringify({ chunks: chunkData.chunks, files: chunkData.fileManifestList }, null, 2));
+    console.log('  [debug] Chunk/manifest data written to', decodePath);
   }
   if (decryptOpts?.aesKeyHex && debug) {
     const firstFile = fileManifestList.find((f) => (f.chunkParts || []).length > 0);
@@ -1181,9 +1568,9 @@ async function reassemble(chunkData, chunksDir, outDir, decryptOpts, opts = {}) 
           const lines = ['decLen=' + decLen, 'rawLen=' + raw.length];
           if (dec && dec.length >= 64) {
             lines.push('first64hex=' + dec.subarray(0, 64).toString('hex'));
-            fs.writeFileSync(path.join(outDir, 'decrypt_first_chunk.bin'), dec);
+            fs.writeFileSync(path.join(debugDir, 'decrypt_first_chunk.bin'), dec);
           }
-          const debugPath = path.join(outDir, 'decrypt_debug.txt');
+          const debugPath = path.join(debugDir, 'decrypt_debug.txt');
           fs.writeFileSync(debugPath, lines.join('\n'));
           console.log('  [decrypt debug]', debugPath, '- decLen=' + decLen + ' (if 0, decryption failed)');
         } catch (_) {}
@@ -1249,18 +1636,53 @@ async function reassemble(chunkData, chunksDir, outDir, decryptOpts, opts = {}) 
 }
 
 async function runFromApi(outDir, chunksDir, opts = {}) {
-  console.log('\nOpen this URL in your browser, sign in, and paste the authorization code:\n');
-  console.log(getAuthUrl(EPIC_UEFN_CLIENT_ID));
-  const code = (await ask('\nAuthorization code: ')).trim();
-  if (!code) {
-    console.error('No code provided.');
-    rl.close();
-    process.exit(1);
+  const tokenOpts = {
+    ...opts,
+    noSaveTokens: !!opts.noSaveTokens,
+    freshLogin: !!opts.freshLogin,
+  };
+
+  let token = null;
+  let tokenData = null;
+  if (!opts.freshLogin) {
+    token = await tryLoadValidUeFnToken(tokenOpts);
+    if (token) console.log('Using saved UEFN token (', path.basename(TOKENS_PATH), ').');
+  }
+  if (!token) {
+    console.log('\nOpen this URL in your browser, sign in, and paste the authorization code:\n');
+    console.log(getAuthUrl(EPIC_UEFN_CLIENT_ID));
+    const code = (await ask('\nAuthorization code: ')).trim();
+    if (!code) {
+      console.error('No code provided.');
+      rl.close();
+      process.exit(1);
+    }
+
+    console.log('\nExchanging code for token...');
+    tokenData = await exchangeAuthCode(EPIC_UEFN_CLIENT_ID, EPIC_UEFN_CLIENT_SECRET, code);
+    token = tokenData.access_token;
+    if (!opts.noSaveTokens) {
+      saveEpicTokensMerge({
+        uefnAccessToken: token,
+        uefnExpiresAt: tokenExpiryToMs(tokenData),
+        uefnRefreshToken: tokenData.refresh_token || undefined,
+      });
+      console.log('Saved tokens to', TOKENS_PATH, '(UEFN; launcher token saved after version lookup).');
+    }
   }
 
-  console.log('\nExchanging code for token...');
-  const tokenData = await exchangeAuthCode(EPIC_UEFN_CLIENT_ID, EPIC_UEFN_CLIENT_SECRET, code);
-  const token = tokenData.access_token;
+  console.log('Resolving Fortnite engine version (CDN path must match the live client)...');
+  const ver = await resolveFortniteEngineVersion(opts.config || {}, {
+    ...tokenOpts,
+    uefnAccessToken: token,
+    engineVersionOverride: opts.engineVersionOverride,
+  });
+  setFortniteUaBuildFromResolvedVersion(ver);
+  const { major, minor, cl, cdnPathSegment, source: versionSource } = ver;
+  console.log(`  ${cdnPathSegment} — ${versionSource}`);
+  if (versionSource.indexOf('FortniteAPI') !== -1) {
+    console.log('  Tip: if manifest download fails (403) or module looks wrong, install Fortnite and set game path in config, or pass --engine-version MAJOR.MINOR.CL (copy from client URL or Paks name).');
+  }
 
   const mapCode = (await ask('Map code (e.g. 3225-0366-8885): ')).trim();
   if (!mapCode) {
@@ -1268,9 +1690,6 @@ async function runFromApi(outDir, chunksDir, opts = {}) {
     rl.close();
     process.exit(1);
   }
-
-  console.log('Fetching latest Fortnite version...');
-  const { major, minor, cl } = await getLatestVersion();
 
   console.log('Fetching cooked content package...');
   const cooked = await getCookedContentPackage(token, mapCode, major, minor, cl);
@@ -1295,7 +1714,7 @@ async function runFromApi(outDir, chunksDir, opts = {}) {
     process.exit(1);
   }
 
-  const baseUrl = `https://cooked-content-live-cdn.epicgames.com/valkyrie/cooked-content/${moduleId}/${major}.${minor}.${cl}/v${version}/${cookJobId}/`;
+  const baseUrl = `https://cooked-content-live-cdn.epicgames.com/valkyrie/cooked-content/${moduleId}/${cdnPathSegment}/v${version}/${cookJobId}/`;
   const manifestPath = contentModule.binaries.manifest;
   const manifestUrl = baseUrl + manifestPath;
   const chunkPrefix = manifestPath.includes('/') ? manifestPath.replace(/\/[^/]*$/, '/') : '';
@@ -1315,8 +1734,18 @@ async function runFromApi(outDir, chunksDir, opts = {}) {
     }
   }
 
+  if (opts.debug) {
+    console.error('[manifest] moduleId:', moduleId);
+    console.error('[manifest] version:', version);
+    console.error('[manifest] cookJobId:', cookJobId);
+    console.error('[manifest] Fortnite engine (CDN segment):', cdnPathSegment);
+    console.error('[manifest] manifestPath (relative):', manifestPath);
+    console.error('[manifest] chunkPrefix:', chunkPrefix || '(none)');
+    console.error('[manifest] baseUrl:', baseUrl);
+    console.error('[manifest] manifestUrl (full):', manifestUrl);
+  }
   console.log('Downloading manifest...');
-  const manifestBuf = await get(manifestUrl, { token });
+  const manifestBuf = await get(manifestUrl, { token, debug: opts.debug });
   console.log('Parsing UEFN manifest...');
   const chunkData = parseUEFNManifestFromBuffer(manifestBuf);
   const { chunks, fileManifestList } = chunkData;
@@ -1354,9 +1783,11 @@ async function runFromApi(outDir, chunksDir, opts = {}) {
           console.log(`  Partial: ${filename} (${missingCount} chunk part(s) failed to decompress; missing GUIDs: ${missingGuids.join(', ')}${missingCount > 3 ? '...' : ''})`);
         }
         console.log('  (Missing ranges: zero-filled, or set UEFN_KEEP_RAW_MISSING=1 to write encrypted bytes.)');
-        if (opts.debug) console.log('  (Inspect failing_chunk_raw_hex.txt in output folder for raw bytes of one failing chunk.)');
+        if (opts.debug) console.log('  (Inspect debug/ folder in output for failing_chunk_raw_hex.txt and other debug files.)');
         console.log('  (Some chunks may use an unsupported encryption format; 3/4 files are complete.)');
         if (opts.debug) {
+          const debugDir = path.join(outDir, 'debug');
+          if (!fs.existsSync(debugDir)) fs.mkdirSync(debugDir, { recursive: true });
           const first = re.partialFiles[0];
           const missingGuid = first?.missingGuids?.[0];
           const chunkInfo = chunkData.chunks.find((c) => c.guidHex === missingGuid);
@@ -1368,7 +1799,7 @@ async function runFromApi(outDir, chunksDir, opts = {}) {
               console.log('  [debug] Failing chunk file:', chunkPath);
               console.log('  [debug] Size:', raw.length, 'bytes; first 64 (hex):', preview.toString('hex'));
               if (raw.length >= 32) {
-                const payloadPath = path.join(outDir, `failing_chunk_${missingGuid}.bin`);
+                const payloadPath = path.join(debugDir, `failing_chunk_${missingGuid}.bin`);
                 fs.writeFileSync(payloadPath, raw.subarray(32));
                 console.log('  [debug] Payload (bytes 32+) written to:', payloadPath);
               }
@@ -1393,18 +1824,35 @@ async function main() {
   let chunksDir = path.join(process.cwd(), 'chunks');
   let baseUrl = null;
   let debug = false;
+  let engineVersionOverride = null;
+  let noSaveTokens = false;
+  let freshLogin = false;
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--out' && args[i + 1]) outDir = path.resolve(args[++i]);
     else if (args[i] === '--base' && args[i + 1]) baseUrl = (args[++i]).replace(/\/?$/, '/');
     else if (args[i] === '--chunks' && args[i + 1]) chunksDir = path.resolve(args[++i]);
+    else if (args[i] === '--engine-version' && args[i + 1]) engineVersionOverride = args[++i];
+    else if (args[i] === '--no-save-tokens') noSaveTokens = true;
+    else if (args[i] === '--fresh-login') freshLogin = true;
     else if (args[i] === '--debug') debug = true;
     else if (!args[i].startsWith('--')) manifestPath = args[i];
   }
   initOodle(config, debug);
 
   const hasLocalManifest = manifestPath && fs.existsSync(manifestPath);
+  if (hasLocalManifest) {
+    if (engineVersionOverride) {
+      try {
+        setFortniteUaBuildFromResolvedVersion(parseEngineVersionString(engineVersionOverride));
+      } catch (_) {}
+    } else if (config.fortniteGamePath) {
+      const fromPaks = tryReadEngineVersionFromPaksDir(path.join(config.fortniteGamePath, 'Content', 'Paks'));
+      if (fromPaks) setFortniteUaBuildFromResolvedVersion(fromPaks);
+    }
+  }
+
   if (!hasLocalManifest) {
-    await runFromApi(outDir, chunksDir, { debug, config });
+    await runFromApi(outDir, chunksDir, { debug, config, engineVersionOverride, noSaveTokens, freshLogin });
     rl.close();
     return;
   }
@@ -1432,7 +1880,7 @@ async function main() {
     for (const { filename, missingCount, missingGuids } of re.partialFiles) {
       console.log(`  Partial: ${filename} (${missingCount} chunk part(s) failed to decompress; missing GUIDs: ${missingGuids.join(', ')}${missingCount > 3 ? '...' : ''})`);
     }
-    if (debug) console.log('  (Inspect failing_chunk_raw_hex.txt in output folder for raw bytes of one failing chunk.)');
+    if (debug) console.log('  (Inspect debug/ folder in output for failing_chunk_raw_hex.txt and other debug files.)');
   }
   const outNames = fileManifestList.map((f) => f.filename || f.name).filter(Boolean);
   console.log('\nDone. Output:', outNames.length ? outNames.join(', ') : 'none');
@@ -1449,6 +1897,12 @@ if (process.argv.includes('--worker')) {
 } else {
   main().catch((e) => {
     console.error(e.response?.data || e.message || e);
+    if (e && e.url) console.error('[HTTP] Failed URL:', e.url);
+    if (e && e.statusCode != null) console.error('[HTTP] Status:', e.statusCode, e.statusMessage || '');
+    if (e && e.responseBodyPreview && Buffer.isBuffer(e.responseBodyPreview)) {
+      const prev = e.responseBodyPreview.toString('utf8');
+      console.error('[HTTP] Body preview:', prev.length > 2000 ? `${prev.slice(0, 2000)}…` : prev);
+    }
     if (e && e.stack) console.error(e.stack);
     process.exit(1);
   });
