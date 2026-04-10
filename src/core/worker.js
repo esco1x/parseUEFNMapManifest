@@ -9,7 +9,12 @@ const { decompressChunkToBuffer } = require('./chunkDecompress');
 
 async function runWorker() {
   initOodle({}, false, ROOT);
-  const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
+  const debugWorker = process.env.UEFN_DEBUG_WORKER === '1';
+  const rl = readline.createInterface({
+    input: process.stdin,
+    crlfDelay: Infinity,
+    terminal: false,
+  });
   let firstChunkLogged = false;
   for await (const line of rl) {
     if (!line.trim()) continue;
@@ -18,7 +23,7 @@ async function runWorker() {
       const msg = JSON.parse(line);
       const chunkPath = path.isAbsolute(msg.chunkPath) ? msg.chunkPath : path.join(msg.cwd || process.cwd(), msg.chunkPath);
       const requiredSize = typeof msg.requiredSize === 'number' ? msg.requiredSize : 0;
-      if (!firstChunkLogged) {
+      if (debugWorker && !firstChunkLogged) {
         firstChunkLogged = true;
         const hasKey = !!(msg.decryptOpts?.aesKeyHex);
         const raw = fs.existsSync(chunkPath) ? fs.readFileSync(chunkPath) : null;
