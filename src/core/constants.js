@@ -16,8 +16,8 @@ const OAUTH_VERIFY_URL = 'https://account-public-service-prod.ol.epicgames.com/a
 const LAUNCHER_CLIENT_ID = '34a02cf8f4414e29b15921876da36f9a';
 const LAUNCHER_CLIENT_SECRET = 'daafbccc737745039dffe53d94fc76cf';
 
-const FORTNITE_STUDIO_ASSETS_URL =
-  'https://launcher-public-service-prod06.ol.epicgames.com/launcher/api/public/assets/v2/platform/Windows/namespace/fn/catalogItem/1e8bda5cfbb641b9a9aea8bd62285f73/app/Fortnite_Studio/label/Live';
+const LAUNCHER_APP_INFO_URL =
+  'https://launcher-public-service-prod.ak.epicgames.com/launcher/api/public/assets/platform/Windows/label/Live/appInfo';
 
 module.exports = {
   HEADER_MAGIC,
@@ -35,5 +35,5 @@ module.exports = {
   OAUTH_VERIFY_URL,
   LAUNCHER_CLIENT_ID,
   LAUNCHER_CLIENT_SECRET,
-  FORTNITE_STUDIO_ASSETS_URL,
+  LAUNCHER_APP_INFO_URL,
 };

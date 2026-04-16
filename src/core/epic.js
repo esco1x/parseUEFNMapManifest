@@ -13,7 +13,7 @@ const {
   OAUTH_VERIFY_URL,
   LAUNCHER_CLIENT_ID,
   LAUNCHER_CLIENT_SECRET,
-  FORTNITE_STUDIO_ASSETS_URL,
+  LAUNCHER_APP_INFO_URL,
 } = require('./constants');
 
 function getAuthUrl(clientId) {
@@ -100,20 +100,6 @@ function tryReadEngineVersionFromPaksDir(paksDir) {
     }
   } catch (_) {}
   return best;
-}
-
-async function getLatestVersionFromFortniteApi() {
-  const versionsUrl = 'https://api.fortniteapi.com/v1/versions';
-  const { data } = await axios.get(versionsUrl);
-  const latest = data.find(
-    (v) => v.meta?.tag === 'latest' && v.meta?.state === 'READY' && v.version?.platform === 'Windows'
-  );
-  if (!latest) throw new Error('Unable to find latest Fortnite version.');
-  const idParts = String(latest.version.id || '').split('.');
-  const major = idParts[0] || '0';
-  const minor = idParts[1] != null ? idParts[1] : '0';
-  const cl = latest.version.build;
-  return normalizeEngineVersion(major, minor, cl);
 }
 
 function parseBuildVersionFromLauncherString(buildVersion) {
@@ -206,14 +192,23 @@ async function getOrRefreshLauncherAccessToken(uefnAccessToken, opts = {}) {
 }
 
 async function fetchFortniteStudioBuildVersion(launcherAccessToken, opts = {}) {
+  const body = {
+    appKeys: [
+      {
+        artifactId: 'Fortnite_Studio',
+        catalogId: '1e8bda5cfbb641b9a9aea8bd62285f73',
+        sandboxId: 'fn',
+      },
+    ],
+  };
   try {
-    if (isHttpDebug(opts)) console.error('[launcher] GET', FORTNITE_STUDIO_ASSETS_URL);
-    const { data } = await axios.get(FORTNITE_STUDIO_ASSETS_URL, {
+    if (isHttpDebug(opts)) console.error('[launcher] POST', LAUNCHER_APP_INFO_URL);
+    const { data } = await axios.post(LAUNCHER_APP_INFO_URL, body, {
       headers: { Authorization: `Bearer ${launcherAccessToken}` },
     });
-    const el = data?.elements?.[0];
+    const el = Array.isArray(data) ? data[0] : null;
     const bv = el?.buildVersion;
-    if (!bv) throw new Error('Launcher assets: elements[0].buildVersion missing');
+    if (!bv) throw new Error('Launcher appInfo: [0].buildVersion missing');
     const parsed = parseBuildVersionFromLauncherString(bv);
     if (!parsed) throw new Error(`Launcher assets: could not parse buildVersion "${bv}"`);
     return { ...parsed, rawBuildVersion: bv };
@@ -284,14 +279,7 @@ async function resolveFortniteEngineVersion(config, opts = {}) {
   if (fromPaks) {
     return { ...fromPaks, source: 'local Paks (Release-*-CL-* filename)' };
   }
-  const versionsUrl = 'https://api.fortniteapi.com/v1/versions';
-  try {
-    const v = await getLatestVersionFromFortniteApi();
-    return { ...v, source: `FortniteAPI ${versionsUrl} (may lag behind live client)` };
-  } catch (e) {
-    if (e.message !== 'Unable to find latest Fortnite version.') logAxiosError(`getLatestVersion (GET ${versionsUrl})`, e);
-    throw e;
-  }
+  throw new Error('Unable to resolve engine version from Epic launcher API or local Paks. Pass --engine-version MAJOR.MINOR.CL.');
 }
 
 async function getCookedContentPackage(token, mapCode, major, minor, cl) {
@@ -343,7 +331,6 @@ module.exports = {
   normalizeEngineVersion,
   parseEngineVersionString,
   tryReadEngineVersionFromPaksDir,
-  getLatestVersionFromFortniteApi,
   parseBuildVersionFromLauncherString,
   verifyAccessToken,
   refreshUeFnToken,
