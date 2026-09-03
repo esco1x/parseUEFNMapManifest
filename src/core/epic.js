@@ -284,7 +284,7 @@ async function resolveFortniteEngineVersion(config, opts = {}) {
 
 async function getCookedContentPackage(token, mapCode, major, minor, cl) {
   const mapCodeNorm = mapCode.replace(/\s/g, '').trim();
-  const url = `${CONTENT_API}/api/content/v2/link/${mapCodeNorm}/cooked-content-package`;
+  const url = `${CONTENT_API}/api/content/v4/cooked-content-package/link/${mapCodeNorm}`;
   try {
     const { data } = await axios.get(url, {
       params: { role: 'client', platform: 'windows', major, minor, patch: cl },
